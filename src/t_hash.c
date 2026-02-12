@@ -3014,26 +3014,23 @@ static void addHashIteratorCursorToReply(client *c, hashTypeIterator *hi, int wh
 void genericHgetallCommand(client *c, int flags) {
     kvobj *o;
     hashTypeIterator hi;
-    int length, count = 0;
+    int count = 0;
     size_t oldsize = 0;
+    void *replylen;
 
     robj *emptyResp = (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) ?
         shared.emptymap[c->resp] : shared.emptyarray;
     if ((o = lookupKeyReadOrReply(c,c->argv[1],emptyResp))
         == NULL || checkType(c,o,OBJ_HASH)) return;
 
-    /* We return a map if the user requested keys and values, like in the
-     * HGETALL case. Otherwise to use a flat array makes more sense. */
-    if ((length = hashTypeLength(o, 1 /*subtractExpiredFields*/)) == 0) {
-        addReply(c, emptyResp);
-        return;
-    }
-
-    if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) {
-        addReplyMapLen(c, length);
-    } else {
-        addReplyArrayLen(c, length);
-    }
+    /* Avoid an up-front "visible length" computation under HFE by emitting a
+     * deferred reply header and finalizing it after iteration. For empty hashes
+     * we finalize to 0.
+     *
+     * This keeps the cost to a single pass (the iteration needed to emit the
+     * actual fields), and naturally accounts for skipping expired fields.
+     */
+    replylen = addReplyDeferredLen(c);
 
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(o);
@@ -3054,9 +3051,12 @@ void genericHgetallCommand(client *c, int flags) {
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
 
-    /* Make sure we returned the right number of elements. */
-    if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) count /= 2;
-    serverAssert(count == length);
+    if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) {
+        serverAssert((count % 2) == 0);
+        setDeferredMapLen(c, replylen, count / 2);
+    } else {
+        setDeferredArrayLen(c, replylen, count);
+    }
 }
 
 void hkeysCommand(client *c) {
