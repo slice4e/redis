@@ -782,12 +782,100 @@ void sismemberCommand(client *c) {
         updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), set, oldsize, kvobjAllocSize(set));
 }
 
+/* SMISMEMBER fast path for OBJ_ENCODING_LISTPACK.
+ *
+ * Instead of calling lpFind() per requested member — each a full O(L)
+ * traversal involving varint decoding, bounds checking, and skip logic
+ * — walk the listpack once and match each entry against the requested
+ * members using simple memcmp comparisons.
+ *
+ * This reduces the expensive listpack traversal overhead from O(N * L)
+ * to O(L), replacing it with O(N) cheap memcmp calls per LP entry.
+ *
+ * Set listpacks have a flat layout (skip=0): every entry is a member
+ * value, so every LP entry is a candidate for matching. */
+static void smismemberListpackSinglePass(client *c, robj *set) {
+    serverAssert(set->encoding == OBJ_ENCODING_LISTPACK);
+
+    int num_members = c->argc - 2;
+    unsigned char *lp = set->ptr;
+
+    /* Result array: 1 if found, 0 if not found.
+     * Using zcalloc so all entries start as 0. */
+    char *results = zcalloc(sizeof(char) * num_members);
+
+    /* Track how many unique members remain to be found.  Once all are
+     * found, we can stop traversing the listpack early. */
+    int remaining = num_members;
+
+    /* --- Single pass over the listpack --- */
+
+    unsigned char *p = lpFirst(lp);
+
+    while (p != NULL && remaining > 0) {
+        /* Decode the current entry */
+        int64_t elen;
+        unsigned char *estr = lpGet(p, &elen, NULL);
+
+        /* Compare this LP entry against each unfound requested member */
+        for (int i = 0; i < num_members; i++) {
+            if (results[i])
+                continue;   /* already found this argv slot */
+
+            sds reqMember = c->argv[i + 2]->ptr;
+            size_t reqLen = sdslen(reqMember);
+
+            int match;
+            if (estr != NULL) {
+                /* LP entry is a string: compare raw bytes */
+                match = (reqLen == (size_t)elen &&
+                         memcmp(reqMember, estr, elen) == 0);
+            } else {
+                /* LP entry is integer-encoded.
+                 * Parse the argv string as integer and compare. */
+                long long reqll;
+                match = (string2ll(reqMember, reqLen, &reqll) &&
+                         reqll == (long long)elen);
+            }
+
+            if (match) {
+                results[i] = 1;
+                remaining--;
+                /* Don't break: duplicate members in argv should all
+                 * get a result.  Each LP entry is unique in a set, so
+                 * no further LP entries will match this value — but
+                 * other argv slots may have the same member. */
+            }
+        }
+
+        /* Advance to the next entry (flat layout, no skip) */
+        p = lpNext(lp, p);
+    }
+
+    /* --- Emit replies in request order --- */
+
+    addReplyArrayLen(c, num_members);
+
+    for (int i = 0; i < num_members; i++) {
+        addReply(c, results[i] ? shared.cone : shared.czero);
+    }
+
+    zfree(results);
+}
+
 void smismemberCommand(client *c) {
     /* Don't abort when the key cannot be found. Non-existing keys are empty
      * sets, where SMISMEMBER should respond with a series of zeros. */
     size_t oldsize = 0;
     kvobj *set = lookupKeyRead(c->db, c->argv[1]);
     if (set && checkType(c,set,OBJ_SET)) return;
+
+    /* Fast path: single-pass listpack scan for plain LISTPACK encoding.
+     * Not applicable to HT (already O(1) per lookup) or INTSET. */
+    if (set != NULL && set->encoding == OBJ_ENCODING_LISTPACK) {
+        smismemberListpackSinglePass(c, set);
+        return;
+    }
 
     addReplyArrayLen(c,c->argc - 2);
 

@@ -76,6 +76,59 @@ start_server {
         assert_match {*ERR*wrong*number*arg*} $e
     }
 
+    test {SMISMEMBER with duplicate members in argv - listpack} {
+        create_set myset {a b c}
+        assert_encoding listpack myset
+        assert_equal {1 1} [r smismember myset a a]
+        assert_equal {0 0} [r smismember myset x x]
+        assert_equal {1 0 1} [r smismember myset b x b]
+    }
+
+    test {SMISMEMBER with duplicate members in argv - hashtable} {
+        r del myset
+        for {set i 0} {$i < 200} {incr i} {r sadd myset "item$i"}
+        assert_encoding hashtable myset
+        assert_equal {1 1} [r smismember myset item0 item0]
+        assert_equal {0 0} [r smismember myset missing missing]
+        assert_equal {1 0 1} [r smismember myset item5 missing item5]
+    }
+
+    test {SMISMEMBER with integer-encoded listpack entries} {
+        create_set myset {100 200 300 hello world}
+        assert_encoding listpack myset
+        assert_equal {1 1 0} [r smismember myset 100 300 999]
+        assert_equal {0 1} [r smismember myset 999 200]
+        assert_equal {1 1 1} [r smismember myset hello 100 world]
+        assert_equal {0 0} [r smismember myset 101 nothere]
+    }
+
+    test {SMISMEMBER with many members - listpack} {
+        create_set myset {a b c d e f g h i j}
+        assert_encoding listpack myset
+        # All found
+        assert_equal {1 1 1 1 1 1 1 1 1 1} [r smismember myset a b c d e f g h i j]
+        # All missing
+        assert_equal {0 0 0 0 0} [r smismember myset x y z w v]
+        # Mix of 5 found and 5 missing
+        assert_equal {1 0 1 0 1 0 1 0 1 0} [r smismember myset a x c y e z g w i v]
+    }
+
+    test {SMISMEMBER all members missing on existing set - listpack} {
+        create_set myset {alpha beta gamma}
+        assert_encoding listpack myset
+        assert_equal {0 0 0 0} [r smismember myset one two three four]
+    }
+
+    test {SMISMEMBER all members found triggers early exit - listpack} {
+        create_set myset {a b c d e f g h i j k l m n o p q r s t u v w x y z}
+        assert_encoding listpack myset
+        # Query a small subset — should be found early in traversal
+        assert_equal {1 1 1} [r smismember myset a b c]
+        # Query all 26
+        assert_equal {1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1} \
+            [r smismember myset a b c d e f g h i j k l m n o p q r s t u v w x y z]
+    }
+
     test {SADD against non set} {
         r lpush mylist foo
         assert_error WRONGTYPE* {r sadd mylist bar}
